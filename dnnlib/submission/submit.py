@@ -25,6 +25,7 @@ from enum import Enum
 
 from .. import util
 from ..util import EasyDict
+import horovod.tensorflow as hvd
 
 
 class SubmitTarget(Enum):
@@ -166,7 +167,7 @@ def _create_run_dir_local(submit_config: SubmitConfig) -> str:
 
     submit_config.run_id = _get_next_run_id_local(run_dir_root)
     submit_config.run_name = "{0:05d}-{1}".format(submit_config.run_id, submit_config.run_desc)
-    run_dir = os.path.join(run_dir_root, submit_config.run_name)
+    run_dir = os.path.join(run_dir_root, submit_config.run_name + '-' + str(hvd.local_rank()))
 
     if os.path.exists(run_dir):
         raise RuntimeError("The run dir already exists! ({0})".format(run_dir))
@@ -226,8 +227,9 @@ def run_wrapper(submit_config: SubmitConfig) -> None:
     is_local = submit_config.submit_target == SubmitTarget.LOCAL
 
     checker = None
-
     # when running locally, redirect stderr to stdout, log stdout to a file, and force flushing
+    # ajay - do this for all ranks?
+    # if hvd.rank() == 0:
     if is_local:
         logger = util.Logger(file_name=os.path.join(submit_config.run_dir, "log.txt"), file_mode="w", should_flush=True)
     else:  # when running in a cluster, redirect stderr to stdout, and just force flushing (log writing is handled by run.sh)
@@ -271,6 +273,8 @@ def submit_run(submit_config: SubmitConfig, run_func_name: str, **run_func_kwarg
     submit_config.run_func_kwargs = run_func_kwargs
 
     assert submit_config.submit_target == SubmitTarget.LOCAL
+    # ajay - do this for all ranks?
+    #if hvd.rank() == 0:
     if submit_config.submit_target in {SubmitTarget.LOCAL}:
         run_dir = _create_run_dir_local(submit_config)
 

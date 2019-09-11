@@ -10,6 +10,7 @@
 import os
 import numpy as np
 import tensorflow as tf
+import horovod.tensorflow as hvd
 
 from typing import Any, Iterable, List, Union
 
@@ -84,6 +85,7 @@ def _sanitize_tf_config(config_dict: dict = None) -> dict:
     cfg["env.TF_CPP_MIN_LOG_LEVEL"]         = "1"       # 0 = Print all available debug info from TensorFlow. 1 = Print warnings and errors, but disable debug info.
     cfg["graph_options.place_pruned_graph"] = True      # False = Check that all ops are available on the designated device. True = Skip the check for ops that are not used.
     cfg["gpu_options.allow_growth"]         = True      # False = Allocate all GPU memory at the beginning. True = Allocate only as much GPU memory as needed.
+    cfg["gpu_options.visible_device_list"]  = str(hvd.local_rank())
 
     # User overrides.
     if config_dict is not None:
@@ -130,6 +132,9 @@ def create_session(config_dict: dict = None, force_as_default: bool = False) -> 
     # Setup TensorFlow config proto.
     cfg = _sanitize_tf_config(config_dict)
     config_proto = tf.ConfigProto()
+    # ajay - Horovod: pin GPU to be used to process local rank (one GPU per process)
+    # config_proto.gpu_options.allow_growth = True
+    # config_proto.gpu_options.visible_device_list = str(hvd.local_rank())
     for key, value in cfg.items():
         fields = key.split(".")
         if fields[0] not in ["rnd", "env"]:

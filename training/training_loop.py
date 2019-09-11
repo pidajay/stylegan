@@ -19,6 +19,7 @@ import train
 from training import dataset
 from training import misc
 from metrics import metric_base
+import horovod.tensorflow as hvd
 
 #----------------------------------------------------------------------------
 # Just-in-time processing of training images before feeding them to the networks.
@@ -129,7 +130,7 @@ def training_loop(
     total_kimg              = 15000,    # Total length of the training, measured in thousands of real images.
     mirror_augment          = False,    # Enable mirror augment?
     drange_net              = [-1,1],   # Dynamic range used when feeding image data to the networks.
-    image_snapshot_ticks    = 1,        # How often to export image snapshots?
+    image_snapshot_ticks    = 10,        # How often to export image snapshots?
     network_snapshot_ticks  = 10,       # How often to export network snapshots?
     save_tf_graph           = False,    # Include full TensorFlow computation graph in the tfevents file?
     save_weight_histograms  = False,    # Include weight histograms in the tfevents file?
@@ -140,22 +141,29 @@ def training_loop(
 
     # Initialize dnnlib and TensorFlow.
     ctx = dnnlib.RunContext(submit_config, train)
+    
+    # ajay - move init to after graph creation?
     tflib.init_tf(tf_config)
-
+    
     # Load training set.
-    training_set = dataset.load_dataset(data_dir=config.data_dir, verbose=True, **dataset_args)
+    print('ajay - config data dir', config.data_dir)
+    training_set = dataset.load_dataset(data_dir=config.data_dir, verbose=True, num_hosts=hvd.size(), index=hvd.rank(), **dataset_args)
 
     # Construct networks.
-    with tf.device('/gpu:0'):
-        if resume_run_id is not None:
-            network_pkl = misc.locate_network_pkl(resume_run_id, resume_snapshot)
-            print('Loading networks from "%s"...' % network_pkl)
-            G, D, Gs = misc.load_pkl(network_pkl)
-        else:
-            print('Constructing networks...')
-            G = tflib.Network('G', num_channels=training_set.shape[0], resolution=training_set.shape[1], label_size=training_set.label_size, **G_args)
-            D = tflib.Network('D', num_channels=training_set.shape[0], resolution=training_set.shape[1], label_size=training_set.label_size, **D_args)
-            Gs = G.clone('Gs')
+    print('Constructing networks...')
+    G = tflib.Network('G', num_channels=training_set.shape[0], resolution=training_set.shape[1], label_size=training_set.label_size, **G_args)
+    D = tflib.Network('D', num_channels=training_set.shape[0], resolution=training_set.shape[1], label_size=training_set.label_size, **D_args)
+    Gs = G.clone('Gs')
+    # with tf.device('/gpu:0'):
+    #     if resume_run_id is not None:
+    #         network_pkl = misc.locate_network_pkl(resume_run_id, resume_snapshot)
+    #         print('Loading networks from "%s"...' % network_pkl)
+    #         G, D, Gs = misc.load_pkl(network_pkl)
+    #     else:
+    #         print('Constructing networks...')
+    #         G = tflib.Network('G', num_channels=training_set.shape[0], resolution=training_set.shape[1], label_size=training_set.label_size, **G_args)
+    #         D = tflib.Network('D', num_channels=training_set.shape[0], resolution=training_set.shape[1], label_size=training_set.label_size, **D_args)
+    #         Gs = G.clone('Gs')
     G.print_layers(); D.print_layers()
 
     print('Building TensorFlow graph...')
@@ -166,44 +174,49 @@ def training_loop(
         minibatch_split = minibatch_in // submit_config.num_gpus
         Gs_beta         = 0.5 ** tf.div(tf.cast(minibatch_in, tf.float32), G_smoothing_kimg * 1000.0) if G_smoothing_kimg > 0.0 else 0.0
 
-    G_opt = tflib.Optimizer(name='TrainG', learning_rate=lrate_in, **G_opt_args)
-    D_opt = tflib.Optimizer(name='TrainD', learning_rate=lrate_in, **D_opt_args)
-    for gpu in range(submit_config.num_gpus):
-        with tf.name_scope('GPU%d' % gpu), tf.device('/gpu:%d' % gpu):
-            G_gpu = G if gpu == 0 else G.clone(G.name + '_shadow')
-            D_gpu = D if gpu == 0 else D.clone(D.name + '_shadow')
-            lod_assign_ops = [tf.assign(G_gpu.find_var('lod'), lod_in), tf.assign(D_gpu.find_var('lod'), lod_in)]
-            reals, labels = training_set.get_minibatch_tf()
-            reals = process_reals(reals, lod_in, mirror_augment, training_set.dynamic_range, drange_net)
-            with tf.name_scope('G_loss'), tf.control_dependencies(lod_assign_ops):
-                G_loss = dnnlib.util.call_func_by_name(G=G_gpu, D=D_gpu, opt=G_opt, training_set=training_set, minibatch_size=minibatch_split, **G_loss_args)
-            with tf.name_scope('D_loss'), tf.control_dependencies(lod_assign_ops):
-                D_loss = dnnlib.util.call_func_by_name(G=G_gpu, D=D_gpu, opt=D_opt, training_set=training_set, minibatch_size=minibatch_split, reals=reals, labels=labels, **D_loss_args)
-            G_opt.register_gradients(tf.reduce_mean(G_loss), G_gpu.trainables)
-            D_opt.register_gradients(tf.reduce_mean(D_loss), D_gpu.trainables)
-    G_train_op = G_opt.apply_updates()
-    D_train_op = D_opt.apply_updates()
-
+    G_opt = tf.train.AdamOptimizer(learning_rate=lrate_in, beta1=0.0, beta2=0.99, epsilon=1e-8)
+    G_opt = hvd.DistributedOptimizer(G_opt)
+    D_opt = tf.train.AdamOptimizer(learning_rate=lrate_in, beta1=0.0, beta2=0.99, epsilon=1e-8)
+    D_opt = hvd.DistributedOptimizer(D_opt)
+    G_gpu = G
+    D_gpu = D
+    lod_assign_ops = [tf.assign(G_gpu.find_var('lod'), lod_in), tf.assign(D_gpu.find_var('lod'), lod_in)]
+    # ajay - check if unique minibatch is guaranteed i.e sharding is done right!
+    reals, labels = training_set.get_minibatch_tf()
+    reals = process_reals(reals, lod_in, mirror_augment, training_set.dynamic_range, drange_net)
+    with tf.name_scope('G_loss'), tf.control_dependencies(lod_assign_ops):
+        G_loss = dnnlib.util.call_func_by_name(G=G_gpu, D=D_gpu, opt=G_opt, training_set=training_set, minibatch_size=minibatch_split, **G_loss_args)
+    with tf.name_scope('D_loss'), tf.control_dependencies(lod_assign_ops):
+        D_loss = dnnlib.util.call_func_by_name(G=G_gpu, D=D_gpu, opt=D_opt, training_set=training_set, minibatch_size=minibatch_split, reals=reals, labels=labels, **D_loss_args)
+    G_grads = G_opt.compute_gradients(tf.reduce_mean(G_loss), G_gpu.trainables)
+    D_grads = D_opt.compute_gradients(tf.reduce_mean(D_loss), D_gpu.trainables)
+    
+    G_train_op = G_opt.apply_gradients(G_grads)
+    D_train_op = D_opt.apply_gradients(D_grads)
+    # Horovod
+    init_op = tf.initialize_all_variables()
+    bcast_op = hvd.broadcast_global_variables(0)
+    # ajay
+    tf.get_default_session().run([init_op])
+    tflib.run([bcast_op])
+    
     Gs_update_op = Gs.setup_as_moving_average_of(G, beta=Gs_beta)
-    with tf.device('/gpu:0'):
-        try:
-            peak_gpu_mem_op = tf.contrib.memory_stats.MaxBytesInUse()
-        except tf.errors.NotFoundError:
-            peak_gpu_mem_op = tf.constant(0)
-
+    
     print('Setting up snapshot image grid...')
     grid_size, grid_reals, grid_labels, grid_latents = misc.setup_snapshot_image_grid(G, training_set, **grid_args)
+    # todo: ajay - note num_gpus need to change to hvd size when going multi-node
     sched = training_schedule(cur_nimg=total_kimg*1000, training_set=training_set, num_gpus=submit_config.num_gpus, **sched_args)
     grid_fakes = Gs.run(grid_latents, grid_labels, is_validation=True, minibatch_size=sched.minibatch//submit_config.num_gpus)
 
-    print('Setting up run dir...')
-    misc.save_image_grid(grid_reals, os.path.join(submit_config.run_dir, 'reals.png'), drange=training_set.dynamic_range, grid_size=grid_size)
-    misc.save_image_grid(grid_fakes, os.path.join(submit_config.run_dir, 'fakes%06d.png' % resume_kimg), drange=drange_net, grid_size=grid_size)
-    summary_log = tf.summary.FileWriter(submit_config.run_dir)
-    if save_tf_graph:
-        summary_log.add_graph(tf.get_default_graph())
-    if save_weight_histograms:
-        G.setup_weight_histograms(); D.setup_weight_histograms()
+    if hvd.rank() == 0:
+        print('Setting up run dir...')
+        misc.save_image_grid(grid_reals, os.path.join(submit_config.run_dir, 'reals.png'), drange=training_set.dynamic_range, grid_size=grid_size)
+        misc.save_image_grid(grid_fakes, os.path.join(submit_config.run_dir, 'fakes%06d.png' % resume_kimg), drange=drange_net, grid_size=grid_size)
+        summary_log = tf.summary.FileWriter(submit_config.run_dir)
+        if save_tf_graph:
+            summary_log.add_graph(tf.get_default_graph())
+        if save_weight_histograms:
+            G.setup_weight_histograms(); D.setup_weight_histograms()
     metrics = metric_base.MetricGroup(metric_arg_list)
 
     print('Training...\n')
@@ -213,26 +226,33 @@ def training_loop(
     cur_tick = 0
     tick_start_nimg = cur_nimg
     prev_lod = -1.0
-    while cur_nimg < total_kimg * 1000:
+    
+    while cur_nimg < (total_kimg * 1000):
         if ctx.should_stop(): break
 
         # Choose training parameters and configure training ops.
         sched = training_schedule(cur_nimg=cur_nimg, training_set=training_set, num_gpus=submit_config.num_gpus, **sched_args)
         training_set.configure(sched.minibatch // submit_config.num_gpus, sched.lod)
+        # todo: ajay - find a way to manually resetoptimizer
         if reset_opt_for_new_lod:
             if np.floor(sched.lod) != np.floor(prev_lod) or np.ceil(sched.lod) != np.ceil(prev_lod):
-                G_opt.reset_optimizer_state(); D_opt.reset_optimizer_state()
+                tflib.assert_tf_initialized()
+                G_opt_reset_op = [var.initializer for var in G_opt.variables()]
+                D_opt_reset_op = [var.initializer for var in D_opt.variables()]
+                tflib.run(G_opt_reset_op)
+                tflib.run(D_opt_reset_op)
+                # G_opt.reset_optimizer_state(); D_opt.reset_optimizer_state()
         prev_lod = sched.lod
-
+        # grp_train_op = tf.group(D_train_op, [Gs_update_op])
         # Run training ops.
         for _mb_repeat in range(minibatch_repeats):
             for _D_repeat in range(D_repeats):
                 tflib.run([D_train_op, Gs_update_op], {lod_in: sched.lod, lrate_in: sched.D_lrate, minibatch_in: sched.minibatch})
-                cur_nimg += sched.minibatch
+                cur_nimg += sched.minibatch #// submit_config.num_gpus
             tflib.run([G_train_op], {lod_in: sched.lod, lrate_in: sched.G_lrate, minibatch_in: sched.minibatch})
 
         # Perform maintenance tasks once per tick.
-        done = (cur_nimg >= total_kimg * 1000)
+        done = (cur_nimg >= (total_kimg * 1000 ))
         if cur_nimg >= tick_start_nimg + sched.tick_kimg * 1000 or done:
             cur_tick += 1
             tick_kimg = (cur_nimg - tick_start_nimg) / 1000.0
@@ -241,18 +261,32 @@ def training_loop(
             total_time = ctx.get_time_since_start() + resume_time
 
             # Report progress.
-            print('tick %-5d kimg %-8.1f lod %-5.2f minibatch %-4d time %-12s sec/tick %-7.1f sec/kimg %-7.2f maintenance %-6.1f gpumem %-4.1f' % (
-                autosummary('Progress/tick', cur_tick),
-                autosummary('Progress/kimg', cur_nimg / 1000.0),
-                autosummary('Progress/lod', sched.lod),
-                autosummary('Progress/minibatch', sched.minibatch),
-                dnnlib.util.format_time(autosummary('Timing/total_sec', total_time)),
-                autosummary('Timing/sec_per_tick', tick_time),
-                autosummary('Timing/sec_per_kimg', tick_time / tick_kimg),
-                autosummary('Timing/maintenance_sec', maintenance_time),
-                autosummary('Resources/peak_gpu_mem_gb', peak_gpu_mem_op.eval() / 2**30)))
-            autosummary('Timing/total_hours', total_time / (60.0 * 60.0))
-            autosummary('Timing/total_days', total_time / (24.0 * 60.0 * 60.0))
+            # ajay
+            #ajay mod
+            if hvd.rank() == 0:
+                print('tick %-5d kimg %-8.1f lod %-5.2f minibatch %-4d time %-12s sec/tick %-7.1f sec/kimg %-7.2f maintenance %-6.1f ' % (
+                    autosummary('Progress/tick', cur_tick),
+                    autosummary('Progress/kimg', cur_nimg / 1000.0),
+                    autosummary('Progress/lod', sched.lod),
+                    autosummary('Progress/minibatch', sched.minibatch),
+                    dnnlib.util.format_time(autosummary('Timing/total_sec', total_time)),
+                    autosummary('Timing/sec_per_tick', tick_time),
+                    autosummary('Timing/sec_per_kimg', tick_time / tick_kimg),
+                    autosummary('Timing/maintenance_sec', maintenance_time)))
+                autosummary('Timing/total_hours', total_time / (60.0 * 60.0))
+                autosummary('Timing/total_days', total_time / (24.0 * 60.0 * 60.0))
+                # print('tick %-5d kimg %-8.1f lod %-5.2f minibatch %-4d time %-12s sec/tick %-7.1f sec/kimg %-7.2f maintenance %-6.1f gpumem %-4.1f' % (
+                #     autosummary('Progress/tick', cur_tick),
+                #     autosummary('Progress/kimg', cur_nimg / 1000.0),
+                #     autosummary('Progress/lod', sched.lod),
+                #     autosummary('Progress/minibatch', sched.minibatch),
+                #     dnnlib.util.format_time(autosummary('Timing/total_sec', total_time)),
+                #     autosummary('Timing/sec_per_tick', tick_time),
+                #     autosummary('Timing/sec_per_kimg', tick_time / tick_kimg),
+                #     autosummary('Timing/maintenance_sec', maintenance_time),
+                #     autosummary('Resources/peak_gpu_mem_gb', peak_gpu_mem_op.eval() / 2**30)))
+                # autosummary('Timing/total_hours', total_time / (60.0 * 60.0))
+                # autosummary('Timing/total_days', total_time / (24.0 * 60.0 * 60.0))
 
             # Save snapshots.
             if cur_tick % image_snapshot_ticks == 0 or done:
@@ -261,17 +295,20 @@ def training_loop(
             if cur_tick % network_snapshot_ticks == 0 or done or cur_tick == 1:
                 pkl = os.path.join(submit_config.run_dir, 'network-snapshot-%06d.pkl' % (cur_nimg // 1000))
                 misc.save_pkl((G, D, Gs), pkl)
-                metrics.run(pkl, run_dir=submit_config.run_dir, num_gpus=submit_config.num_gpus, tf_config=tf_config)
+                # ajay - note modifying to 1 for eval
+                metrics.run(pkl, run_dir=submit_config.run_dir, num_gpus=1, tf_config=tf_config)
 
             # Update summaries and RunContext.
             metrics.update_autosummaries()
-            tflib.autosummary.save_summaries(summary_log, cur_nimg)
+            if hvd.rank() == 0:
+                tflib.autosummary.save_summaries(summary_log, cur_nimg)
             ctx.update('%.2f' % sched.lod, cur_epoch=cur_nimg // 1000, max_epoch=total_kimg)
             maintenance_time = ctx.get_last_update_interval() - tick_time
 
     # Write final results.
-    misc.save_pkl((G, D, Gs), os.path.join(submit_config.run_dir, 'network-final.pkl'))
-    summary_log.close()
+    if hvd.rank() == 0:
+        misc.save_pkl((G, D, Gs), os.path.join(submit_config.run_dir, 'network-final.pkl'))
+        summary_log.close()
 
     ctx.close()
 

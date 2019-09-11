@@ -157,14 +157,16 @@ def D_logistic_simplegp(G, D, opt, training_set, minibatch_size, reals, labels, 
     loss = tf.nn.softplus(fake_scores_out)  # -log(1 - logistic(fake_scores_out))
     loss += tf.nn.softplus(-real_scores_out)  # -log(logistic(real_scores_out)) # temporary pylint workaround # pylint: disable=invalid-unary-operand-type
 
+    # todo: ajay fix this
     if r1_gamma != 0.0:
         with tf.name_scope('R1Penalty'):
-            real_loss = opt.apply_loss_scaling(tf.reduce_sum(real_scores_out))
-            real_grads = opt.undo_loss_scaling(fp32(tf.gradients(real_loss, [reals])[0]))
+            real_loss = tf.reduce_sum(real_scores_out) # opt.apply_loss_scaling(tf.reduce_sum(real_scores_out))
+            real_grads = fp32(tf.gradients(real_loss, [reals])[0]) # opt.undo_loss_scaling(fp32(tf.gradients(real_loss, [reals])[0]))
             r1_penalty = tf.reduce_sum(tf.square(real_grads), axis=[1,2,3])
             r1_penalty = autosummary('Loss/r1_penalty', r1_penalty)
         loss += r1_penalty * (r1_gamma * 0.5)
 
+    # todo: ajay fix this
     if r2_gamma != 0.0:
         with tf.name_scope('R2Penalty'):
             fake_loss = opt.apply_loss_scaling(tf.reduce_sum(fake_scores_out))

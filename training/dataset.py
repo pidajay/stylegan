@@ -44,7 +44,9 @@ class TFRecordDataset:
         shuffle_mb      = 4096,     # Shuffle data within specified window (megabytes), 0 = disable shuffling.
         prefetch_mb     = 2048,     # Amount of data to prefetch (megabytes), 0 = disable prefetching.
         buffer_mb       = 256,      # Read buffer size (megabytes).
-        num_threads     = 2):       # Number of concurrent threads.
+        num_threads     = 2,        # Number of concurrent threads.
+        num_hosts       = 1,
+        index           = 0):
 
         self.tfrecord_dir       = tfrecord_dir
         self.resolution         = None
@@ -65,6 +67,8 @@ class TFRecordDataset:
         self._tf_minibatch_np   = None
         self._cur_minibatch     = -1
         self._cur_lod           = -1
+        self.num_hosts          = num_hosts
+        self.index              = index
 
         # List tfrecords files and inspect their shapes.
         assert os.path.isdir(self.tfrecord_dir)
@@ -110,7 +114,7 @@ class TFRecordDataset:
         self.label_dtype = self._np_labels.dtype.name
 
         # Build TF expressions.
-        with tf.name_scope('Dataset'), tf.device('/cpu:0'):
+        with tf.name_scope('Dataset'): #, tf.device('/cpu:0'):
             self._tf_minibatch_in = tf.placeholder(tf.int64, name='minibatch_in', shape=[])
             self._tf_labels_var = tflib.create_var_with_large_initial_value(self._np_labels, name='labels_var')
             self._tf_labels_dataset = tf.data.Dataset.from_tensor_slices(self._tf_labels_var)
@@ -127,6 +131,8 @@ class TFRecordDataset:
                     dset = dset.repeat()
                 if prefetch_mb > 0:
                     dset = dset.prefetch(((prefetch_mb << 20) - 1) // bytes_per_item + 1)
+                # ajay - add sharding
+                dset = dset.shard(self.num_hosts, self.index)
                 dset = dset.batch(self._tf_minibatch_in)
                 self._tf_datasets[tfr_lod] = dset
             self._tf_iterator = tf.data.Iterator.from_structure(self._tf_datasets[0].output_types, self._tf_datasets[0].output_shapes)
@@ -155,8 +161,8 @@ class TFRecordDataset:
     # Get random labels as TensorFlow expression.
     def get_random_labels_tf(self, minibatch_size): # => labels
         if self.label_size > 0:
-            with tf.device('/cpu:0'):
-                return tf.gather(self._tf_labels_var, tf.random_uniform([minibatch_size], 0, self._np_labels.shape[0], dtype=tf.int32))
+            # with tf.device('/cpu:0'):
+            return tf.gather(self._tf_labels_var, tf.random_uniform([minibatch_size], 0, self._np_labels.shape[0], dtype=tf.int32))
         return tf.zeros([minibatch_size, 0], self.label_dtype)
 
     # Get random labels as NumPy array.
@@ -225,17 +231,23 @@ class SyntheticDataset:
 #----------------------------------------------------------------------------
 # Helper func for constructing a dataset object using the given options.
 
-def load_dataset(class_name='training.dataset.TFRecordDataset', data_dir=None, verbose=False, **kwargs):
+# todo -ajay do sharding here with index and size
+def load_dataset(class_name='training.dataset.TFRecordDataset', data_dir=None, verbose=False, num_hosts=1, index=0, **kwargs):
     adjusted_kwargs = dict(kwargs)
     if 'tfrecord_dir' in adjusted_kwargs and data_dir is not None:
         adjusted_kwargs['tfrecord_dir'] = os.path.join(data_dir, adjusted_kwargs['tfrecord_dir'])
     if verbose:
         print('Streaming data using %s...' % class_name)
+    # ajay - add sharding
+    adjusted_kwargs['num_hosts'] = num_hosts 
+    adjusted_kwargs['index'] = index 
+    adjusted_kwargs['num_threads'] = 64
     dataset = dnnlib.util.get_obj_by_name(class_name)(**adjusted_kwargs)
     if verbose:
         print('Dataset shape =', np.int32(dataset.shape).tolist())
         print('Dynamic range =', dataset.dynamic_range)
         print('Label size    =', dataset.label_size)
+    #dataset = dataset.shard(num_hosts, index)
     return dataset
 
 #----------------------------------------------------------------------------
